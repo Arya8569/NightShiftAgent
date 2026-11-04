@@ -141,3 +141,4 @@ NightShift prioritizes personal financial sovereignty and privacy. By integratin
 
 ## 📜 License
 Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
+
