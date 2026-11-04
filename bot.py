@@ -34,39 +34,64 @@ logging.basicConfig(
 logger = logging.getLogger("NightShiftBot")
 
 # ---------------------------------------------------------
-# Testing Credit Safety Guardrails ($5.00 Cap)
+# Economics & Guardrail Rates
 # ---------------------------------------------------------
 MAX_TEST_CREDIT_USD = 5.00
-USD_TO_INR_RATE = 86.0  # $5.00 USD ≈ ₹430.00 INR
+USD_TO_INR_RATE = 86.0    # 1 USD ≈ ₹86.00 INR
+ZEC_PRICE_USD = 35.0      # 1 ZEC ≈ $35.00 USD (≈ ₹3,010.00 INR)
 TOTAL_SPENT_USD = 0.0
 
 # ---------------------------------------------------------
-# In-Memory State Store
+# Multi-Beneficiary Data Model & State Store
 # Structure:
-# {
-#   chat_id: {
-#     "phones": {
-#       "+919876543210": {
-#         "operator": "Airtel",
-#         "circle": "Mumbai",
-#         "amount": 299.0,
-#         "expiry": "2026-11-05T04:00:00Z",
-#         "max_budget": 500.0,
-#         "recharged": False,
-#         "last_order": { ... }
-#       }
+# USER_DATA = {
+#     chat_id: {
+#         "vault_zec": 0.35,  # Starting allowance balance
+#         "vault_zaddr": "u1nightshift_shielded_vault_89b2f4c9",
+#         "contacts": {
+#             "Dad": {
+#                 "phone": "9876543210",
+#                 "operator": "Airtel",
+#                 "circle": "Mumbai",
+#                 "active_pack": 299.0,
+#                 "last_amount": 239.0,
+#                 "guardrail_cap": 350.0,
+#                 "expiry": "2026-11-05 04:00:00 UTC",
+#                 "recharged": False,
+#                 "is_tariff_adjusted": True,
+#                 "target_desc": "1.5GB/day Truly Unlimited",
+#                 "last_order": None
+#             }
+#         }
 #     }
-#   }
 # }
 # ---------------------------------------------------------
-USER_MANDATES: Dict[int, Dict[str, Dict[str, Any]]] = {}
+USER_DATA: Dict[int, Dict[str, Any]] = {}
+USER_MANDATES = USER_DATA  # Alias for backward compatibility
 
-# Mock Orchard Incoming Viewing Key for cryptographically simulated audit
 MOCK_ORCHARD_IVK = "uview1orchardqxy28v893kc7f903ml022m7p66xzrw8a7df499k301c9kll08as3s56q"
 
 # ---------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------
+def get_user_session(chat_id: int) -> Dict[str, Any]:
+    """Retrieves or initializes session state for a user chat."""
+    if chat_id not in USER_DATA:
+        random_hex = secrets.token_hex(4)
+        USER_DATA[chat_id] = {
+            "vault_zec": 0.35,  # 0.35 ZEC initial allowance
+            "vault_zaddr": f"u1nightshift_shielded_vault_{random_hex}",
+            "contacts": {}
+        }
+    return USER_DATA[chat_id]
+
+
+def inr_to_zec(amount_inr: float) -> float:
+    """Converts INR amount to ZEC equivalent."""
+    usd = amount_inr / USD_TO_INR_RATE
+    return usd / ZEC_PRICE_USD
+
+
 def parse_expiry(expiry_raw: Any) -> datetime:
     """Parse various expiry date representations into timezone-aware UTC datetime."""
     if isinstance(expiry_raw, datetime):
@@ -83,41 +108,45 @@ def parse_expiry(expiry_raw: Any) -> datetime:
             return dt.astimezone(timezone.utc)
         except ValueError:
             try:
-                dt = datetime.strptime(expiry_raw, "%Y-%m-%d")
+                dt = datetime.strptime(expiry_raw, "%Y-%m-%d %H:%M:%S")
                 return dt.replace(tzinfo=timezone.utc)
             except ValueError:
-                pass
+                try:
+                    dt = datetime.strptime(expiry_raw, "%Y-%m-%d")
+                    return dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
 
     return datetime.now(timezone.utc) + timedelta(hours=12)
 
 
-def generate_zcash_settlement(order_id: str, phone: str, amount: float) -> Dict[str, str]:
+def generate_zcash_settlement(order_id: str, phone: str, amount: float, vault_zaddr: str, zec_cost: float) -> Dict[str, Any]:
     """
     Simulates Zcash Shielded Settlement on the Orchard pool.
     Generates a 512-byte encrypted memo containing transaction references
     and a 64-character shielded transaction hash with 'zx' prefix.
     """
     masked_phone = phone[:3] + "•••" + phone[-4:] if len(phone) >= 7 else phone
-    memo_payload = f"NIGHTSHIFT_MANDATE|ORDER:{order_id}|RECIPIENT:{masked_phone}|AMT:{amount:.2f}INR|SETTLED:ORCHARD_POOL".encode("utf-8")
+    memo_payload = f"NIGHTSHIFT_VAULT|FROM:{vault_zaddr}|ORDER:{order_id}|FOR:{masked_phone}|ZEC:{zec_cost:.4f}|INR:{amount:.2f}|POOL:ORCHARD".encode("utf-8")
     
-    # Pad to exact 512 bytes with cryptographic pseudorandom noise
     padding_needed = max(0, 512 - len(memo_payload))
     full_memo_bytes = memo_payload + secrets.token_bytes(padding_needed)
     memo_hex = full_memo_bytes[:512].hex()
-
-    txid = "zx" + secrets.token_hex(31)  # 64 characters total
+    txid = "zx" + secrets.token_hex(31)
 
     return {
         "txid": txid,
         "memo_hex": memo_hex,
         "memo_preview": memo_payload.decode("utf-8", errors="replace"),
         "pool": "Orchard Shielded Pool",
-        "ivk": MOCK_ORCHARD_IVK
+        "ivk": MOCK_ORCHARD_IVK,
+        "vault_source": vault_zaddr,
+        "zec_settled": zec_cost
     }
 
 
 # ---------------------------------------------------------
-# Telecom Intelligence & Tariff Reconciliation
+# Telecom Intelligence & Legacy Tariff Reconciliation
 # ---------------------------------------------------------
 DEFAULT_CATALOG_PLANS = [
     {"rs": 199.0, "validity": "28 Days", "desc": "1GB/day Unlimited"},
@@ -130,7 +159,7 @@ DEFAULT_CATALOG_PLANS = [
 async def resolve_and_reconcile_plan(phone: str, max_budget: float) -> Dict[str, Any]:
     """
     Reconciles historical telecom recharge data with live operator circle tariffs.
-    Handles outdated/retired packs (e.g. ₹239 -> ₹299) and selects the closest
+    Handles legacy/retired packs (e.g. ₹239 -> ₹299) and selects the closest
     active plan within user-defined budget guardrails.
     """
     digits_only = "".join(filter(str.isdigit, phone))
@@ -143,7 +172,6 @@ async def resolve_and_reconcile_plan(phone: str, max_budget: float) -> Dict[str,
         "Accept": "application/json"
     }
 
-    # Default baseline attributes
     operator = "Airtel"
     circle = "Mumbai"
     last_amount = 239.0
@@ -222,7 +250,6 @@ async def resolve_and_reconcile_plan(phone: str, max_budget: float) -> Dict[str,
     valid_under_budget = [p for p in active_plans if p["rs"] <= max_budget]
     
     if not valid_under_budget:
-        # Guardrail violation: no active plans within user budget
         return {
             "phone": phone,
             "operator": operator,
@@ -241,21 +268,18 @@ async def resolve_and_reconcile_plan(phone: str, max_budget: float) -> Dict[str,
             "error": f"No active plans found within user budget cap of ₹{max_budget:.2f}"
         }
 
-    # Matching Priority:
-    # a. Exact match of last_amount in active catalog
+    # Priority matching: exact match or closest higher active pack
     exact_matches = [p for p in valid_under_budget if abs(p["rs"] - last_amount) < 0.01]
     if exact_matches:
         target_plan = exact_matches[0]
         target_amount = target_plan["rs"]
         is_tariff_adjusted = False
     else:
-        # b. Outdated/retired pack: find closest active plan price >= last_amount
         higher_plans = [p for p in valid_under_budget if p["rs"] >= last_amount]
         if higher_plans:
             higher_plans.sort(key=lambda p: p["rs"])
             target_plan = higher_plans[0]
         else:
-            # Fallback to the highest valid plan under budget
             valid_under_budget.sort(key=lambda p: p["rs"], reverse=True)
             target_plan = valid_under_budget[0]
 
@@ -280,27 +304,14 @@ async def resolve_and_reconcile_plan(phone: str, max_budget: float) -> Dict[str,
     }
 
 
-async def fetch_telecom_intel(phone: str) -> Dict[str, Any]:
-    """Compatibility wrapper around resolve_and_reconcile_plan."""
-    rec = await resolve_and_reconcile_plan(phone, max_budget=99999.0)
-    return {
-        "operator": rec["operator"],
-        "circle": rec["circle"],
-        "amount": rec["target_amount"] or 299.0,
-        "expiry": rec["expiry"],
-        "expiry_dt": rec["expiry_dt"],
-        "source": rec["source"]
-    }
-
-
 # ---------------------------------------------------------
 # Commerce Engine: Bitrefill + Zcash
 # ---------------------------------------------------------
-async def execute_bitrefill_order(operator: str, phone: str, amount: float) -> Dict[str, Any]:
+async def execute_bitrefill_order(operator: str, phone: str, amount: float, vault_zaddr: str) -> Dict[str, Any]:
     """
     Executes autonomous order through Bitrefill API v2.
     Falls back safely to sandbox product 'delos-syldavia' with real-looking order confirmation.
-    Simulates Zcash 512-byte shielded memo settlement.
+    Simulates Zcash 512-byte shielded memo settlement deducted from vault.
     """
     url = "https://api.bitrefill.com/v2/products"
     params = {
@@ -337,7 +348,8 @@ async def execute_bitrefill_order(operator: str, phone: str, amount: float) -> D
     if is_sandbox:
         product_slug = "delos-syldavia"
 
-    zcash_receipt = generate_zcash_settlement(simulated_order_id, phone, amount)
+    zec_cost = inr_to_zec(amount)
+    zcash_receipt = generate_zcash_settlement(simulated_order_id, phone, amount, vault_zaddr, zec_cost)
 
     return {
         "order_id": simulated_order_id,
@@ -345,6 +357,7 @@ async def execute_bitrefill_order(operator: str, phone: str, amount: float) -> D
         "operator": operator,
         "phone": phone,
         "amount": amount,
+        "zec_cost": zec_cost,
         "is_sandbox": is_sandbox,
         "status": "COMPLETED",
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -356,28 +369,84 @@ async def execute_bitrefill_order(operator: str, phone: str, amount: float) -> D
 # Telegram Bot Handlers
 # ---------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cyberpunk welcome message explaining autonomous mandate rules and commands."""
+    """Cyberpunk welcome message explaining multi-beneficiary mandates and Zcash vault."""
+    chat_id = update.effective_chat.id
+    session = get_user_session(chat_id)
     remaining_usd = max(0.0, MAX_TEST_CREDIT_USD - TOTAL_SPENT_USD)
+
     welcome_text = (
-        "🌙 *NIGHTSHIFT BOT // AUTONOMOUS RECHARGE PROTOCOL*\n"
+        "🌙 *NIGHTSHIFT BOT // AUTONOMOUS RECHARGE AGENT*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ *Track:* Bitrefill Agentic Commerce & Zcash Private Settlement\n"
-        "🛡️ *Mission:* Ensure your household telecom never disconnects while you sleep.\n"
-        f"💵 *Test Credit Guardrail:* ${MAX_TEST_CREDIT_USD:.2f} USD max cap (Remaining: `${remaining_usd:.2f}`)\n\n"
-        "🤖 *Autonomous Rules:*\n"
-        "• Monitor plan expiry continuously in background.\n"
-        "• When validity expires within < 24h, check spending cap.\n"
-        "• Autonomously trigger Bitrefill instant recharge.\n"
-        "• Settle anonymously using 512-byte Zcash Orchard Shielded Memo.\n\n"
+        "⚡ *Tracks:* Bitrefill Agentic Commerce & Zcash Private Settlement\n"
+        "🛡️ *Mission:* Protect household connectivity autonomously from a funded Zcash Vault.\n\n"
+        f"🔐 *Shielded Allowance Vault:* `{session['vault_zaddr']}`\n"
+        f"💰 *Vault Balance:* `{session['vault_zec']:.4f} ZEC` (~₹{session['vault_zec'] * ZEC_PRICE_USD * USD_TO_INR_RATE:.0f})\n"
+        f"💵 *Test Spend Cap:* ${MAX_TEST_CREDIT_USD:.2f} USD (Remaining: `${remaining_usd:.2f}`)\n\n"
+        "🤖 *Multi-Beneficiary Features:*\n"
+        "• Manage family, roommates, & personal devices under custom aliases.\n"
+        "• Reconcile retired legacy tariffs to active operator circle packs.\n"
+        "• Deduct settlements automatically from your shielded Zcash vault.\n\n"
         "🕹️ *Available Commands:*\n"
-        "• `/add <phone> <budget>` - Register phone & budget (e.g. `/add +919876543210 $5` or `400`)\n"
-        "• `/list` - Display all monitored numbers & guardrails\n"
-        "• `/credits` - Check remaining testing credit balance ($5.00 safety limit)\n"
-        "• `/simulate` - Trigger instantaneous autonomous refill loop\n"
-        "• `/audit` - Inspect Zcash IVK Shielded cryptographic receipt\n"
+        "• `/add <label> <phone> <cap>` - Add beneficiary (e.g. `/add Dad 9876543210 350`)\n"
+        "• `/list` - Display all family beneficiaries & statuses\n"
+        "• `/vault` - Inspect Zcash shielded allowance vault & balance\n"
+        "• `/deposit [amount]` - Top up your Zcash allowance vault\n"
+        "• `/simulate [label]` - Trigger autonomous refill loop for beneficiary\n"
+        "• `/audit` - Inspect zero-knowledge Zcash Orchard IVK proof\n"
+        "• `/remove <label>` - Remove a beneficiary\n"
+        "• `/credits` - Inspect test spending safety limit\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+
+async def vault_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the Zcash Shielded Allowance Vault details and balance."""
+    chat_id = update.effective_chat.id
+    session = get_user_session(chat_id)
+    inr_equiv = session["vault_zec"] * ZEC_PRICE_USD * USD_TO_INR_RATE
+
+    vault_text = (
+        "🔐 *ZCASH SHIELDED ALLOWANCE VAULT*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🛡️ *Pool:* Orchard Shielded Privacy Pool\n"
+        f"📫 *Shielded Vault Address:*\n`{session['vault_zaddr']}`\n\n"
+        f"💰 *Current Allowance Balance:* `{session['vault_zec']:.4f} ZEC`\n"
+        f"🇮🇳 *Fiat Valuation:* ~₹{inr_equiv:.2f} INR (@ ${ZEC_PRICE_USD}/ZEC)\n"
+        "🟢 *Vault Status:* ACTIVE & READY FOR AUTONOMOUS DEBITS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 *Tip:* Use `/deposit 0.5` to simulate topping up your shielded balance."
+    )
+    await update.message.reply_text(vault_text, parse_mode="Markdown")
+
+
+async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Simulates topping up the Zcash allowance vault."""
+    chat_id = update.effective_chat.id
+    session = get_user_session(chat_id)
+    args = context.args
+
+    deposit_amount = 0.25
+    if args:
+        try:
+            deposit_amount = float(args[0].replace("ZEC", "").strip())
+        except ValueError:
+            await update.message.reply_text("❌ *Error:* Provide a numeric deposit amount in ZEC (e.g. `/deposit 0.5`).", parse_mode="Markdown")
+            return
+
+    session["vault_zec"] += deposit_amount
+    new_inr = session["vault_zec"] * ZEC_PRICE_USD * USD_TO_INR_RATE
+
+    deposit_text = (
+        "⚡ *SHIELDED DEPOSIT CONFIRMED*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 *Deposit Credited:* `+{deposit_amount:.4f} ZEC`\n"
+        f"📫 *Vault Destination:* `{session['vault_zaddr']}`\n"
+        f"💰 *New Balance:* `{session['vault_zec']:.4f} ZEC` (~₹{new_inr:.2f} INR)\n"
+        "🔒 *Settlement:* 24 Confirmed Shielded Blocks (Zero-Knowledge)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(deposit_text, parse_mode="Markdown")
 
 
 async def credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -399,20 +468,29 @@ async def credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Registers a phone number, fetches telecom intelligence, reconciles historical tariffs, and enforces guardrails."""
+    """Registers a beneficiary contact, fetches telecom intelligence, reconciles historical tariffs, and enforces guardrails."""
     chat_id = update.effective_chat.id
+    session = get_user_session(chat_id)
     args = context.args
 
     if not args or len(args) < 2:
         await update.message.reply_text(
-            "⚠️ *Usage:* `/add <phone> <max_budget>`\n"
-            "Example: `/add 9876543210 500` or `/add +919876543210 $5`",
+            "⚠️ *Usage:* `/add <label> <phone> <guardrail_cap>`\n"
+            "Example: `/add Dad 9876543210 350` or `/add Roommate 9123456789 $5`",
             parse_mode="Markdown"
         )
         return
 
-    phone = args[0].strip()
-    raw_budget_str = args[1].strip()
+    # Parse multi-beneficiary parameters
+    if len(args) >= 3:
+        label = args[0].strip()
+        phone = args[1].strip()
+        raw_budget_str = args[2].strip()
+    else:
+        # Fallback if label omitted: /add <phone> <budget>
+        phone = args[0].strip()
+        raw_budget_str = args[1].strip()
+        label = f"Device-{len(session['contacts']) + 1}"
 
     try:
         if raw_budget_str.startswith("$") or "usd" in raw_budget_str.lower():
@@ -421,21 +499,22 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             max_budget = budget_usd * USD_TO_INR_RATE
         else:
             val = float(raw_budget_str.replace("₹", "").replace(",", "").strip())
-            # If value is small (<= 5), treat as USD dollars
             if val <= 5.0:
                 max_budget = val * USD_TO_INR_RATE
             else:
                 max_budget = val
     except ValueError:
-        await update.message.reply_text("❌ *Error:* Budget must be a numeric value or dollar amount (e.g. `500` or `$5`).", parse_mode="Markdown")
+        await update.message.reply_text("❌ *Error:* Budget cap must be a numeric value or dollar amount (e.g. `350` or `$5`).", parse_mode="Markdown")
         return
 
-    # Cap budget at $5.00 limit
     max_allowed_inr = MAX_TEST_CREDIT_USD * USD_TO_INR_RATE
     if max_budget > max_allowed_inr:
         max_budget = max_allowed_inr
 
-    status_msg = await update.message.reply_text("🔍 *Querying Way2API Telecom Intelligence & Reconciling Tariffs...*", parse_mode="Markdown")
+    status_msg = await update.message.reply_text(
+        f"🔍 *Querying Way2API Telecom Intelligence & Reconciling Tariffs for {label}...*",
+        parse_mode="Markdown"
+    )
     rec = await resolve_and_reconcile_plan(phone, max_budget)
 
     operator = rec["operator"]
@@ -452,7 +531,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not guardrail_passed or target_amount is None:
         fail_text = (
-            f"🛑 *Guardrail Violation for* `{phone}`:\n"
+            f"🛑 *Guardrail Violation for* `{label}` (`{phone}`):\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• *Operator:* {operator} ({circle})\n"
             f"• *Historical Pack:* ₹{last_amount:.0f}\n"
@@ -463,24 +542,25 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(fail_text, parse_mode="Markdown")
         return
 
+    zec_cost = inr_to_zec(target_amount)
     plan_cost_usd = target_amount / USD_TO_INR_RATE
     remaining_credit_usd = max(0.0, MAX_TEST_CREDIT_USD - TOTAL_SPENT_USD)
 
-    if chat_id not in USER_MANDATES:
-        USER_MANDATES[chat_id] = {"phones": {}}
-
-    USER_MANDATES[chat_id]["phones"][phone] = {
+    session["contacts"][label] = {
+        "phone": phone,
         "operator": operator,
         "circle": circle,
+        "active_pack": target_amount,
         "amount": target_amount,
         "last_amount": last_amount,
         "last_date": last_date,
         "last_desc": last_desc,
         "target_desc": plan_desc,
-        "is_tariff_adjusted": is_adjusted,
-        "expiry": expiry,
+        "guardrail_cap": max_budget,
         "max_budget": max_budget,
+        "expiry": expiry,
         "recharged": False,
+        "is_tariff_adjusted": is_adjusted,
         "last_order": None
     }
 
@@ -497,78 +577,120 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     response_text = (
-        f"🔍 *Telecom Intelligence Retrieved for* `{phone}`:\n"
+        f"🔍 *Telecom Intelligence Retrieved for* `{label}` (`{phone}`):\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"• *Operator:* {operator} ({circle})\n"
         f"{tariff_lines}"
         f"🛡️ *Guardrail Check:* ₹{target_amount:.0f} <= ₹{max_budget:.0f} Cap (Approved ✅)\n"
+        f"⚡ *Vault Settlement Cost:* `{zec_cost:.4f} ZEC` (Vault Balance: `{session['vault_zec']:.4f} ZEC`)\n"
         f"💵 *Test Credit Remaining:* `${remaining_credit_usd:.2f}` / ${MAX_TEST_CREDIT_USD:.2f}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🌙 *Auto-procurement armed for expiry alert.* Run `/simulate` to test the loop immediately."
+        f"🌙 *Auto-procurement armed for {label}.* Run `/simulate {label}` to test immediately."
     )
     await status_msg.edit_text(response_text, parse_mode="Markdown")
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lists all monitored numbers for this chat and credit limit status."""
+    """Lists all family/roommate beneficiaries for this chat and vault balance."""
     chat_id = update.effective_chat.id
-    phones = USER_MANDATES.get(chat_id, {}).get("phones", {})
+    session = get_user_session(chat_id)
+    contacts = session.get("contacts", {})
     remaining_usd = max(0.0, MAX_TEST_CREDIT_USD - TOTAL_SPENT_USD)
 
-    if not phones:
+    if not contacts:
         await update.message.reply_text(
-            f"📭 *No monitored numbers found.*\n"
-            f"💵 *Test Credit Remaining:* `${remaining_usd:.2f}` / ${MAX_TEST_CREDIT_USD:.2f}\n"
-            "Use `/add <phone> <max_budget>` to enroll a number.",
+            f"📭 *No monitored beneficiaries found.*\n"
+            f"💰 *Vault Balance:* `{session['vault_zec']:.4f} ZEC`\n"
+            "Use `/add <label> <phone> <cap>` (e.g. `/add Dad 9876543210 350`) to enroll a family member.",
             parse_mode="Markdown"
         )
         return
 
     lines = [
-        "📋 *NIGHTSHIFT MONITORED NUMBERS*",
-        f"💵 *Testing Credits:* `${remaining_usd:.2f} USD remaining` (Cap: ${MAX_TEST_CREDIT_USD:.2f})",
+        "📋 *NIGHTSHIFT BENEFICIARY MANDATES*",
+        f"💰 *Vault Balance:* `{session['vault_zec']:.4f} ZEC` | *Test Pool:* `${remaining_usd:.2f}`",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     ]
-    for idx, (phone, details) in enumerate(phones.items(), start=1):
+    for idx, (label, details) in enumerate(contacts.items(), start=1):
         status_icon = "🟢 ACTIVE" if not details["recharged"] else "⚡ RECHARGED"
-        adj_tag = f" [🔄 Reconciled ₹{details.get('last_amount', 0):.0f} ➔ ₹{details['amount']:.0f}]" if details.get("is_tariff_adjusted") else ""
+        adj_tag = f" [🔄 Reconciled ₹{details.get('last_amount', 0):.0f} ➔ ₹{details['active_pack']:.0f}]" if details.get("is_tariff_adjusted") else ""
+        zec_cost = inr_to_zec(details["active_pack"])
         lines.append(
-            f"*{idx}.* `{phone}` [{status_icon}]\n"
+            f"*{idx}. {label}* (`{details['phone']}`) [{status_icon}]\n"
             f"   • *Carrier:* {details['operator']} ({details['circle']}){adj_tag}\n"
-            f"   • *Plan:* ₹{details['amount']:.2f} ({details.get('target_desc', 'Truly Unlimited')})\n"
-            f"   • *Cap:* ₹{details['max_budget']:.2f}\n"
+            f"   • *Plan:* ₹{details['active_pack']:.2f} ({details.get('target_desc', 'Truly Unlimited')})\n"
+            f"   • *Vault Cost:* ~`{zec_cost:.4f} ZEC` | *Cap:* ₹{details['guardrail_cap']:.2f}\n"
             f"   • *Expiry:* `{details['expiry']}`\n"
         )
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes a registered beneficiary."""
+    chat_id = update.effective_chat.id
+    session = get_user_session(chat_id)
+    contacts = session.get("contacts", {})
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("⚠️ *Usage:* `/remove <label>`\nExample: `/remove Dad`", parse_mode="Markdown")
+        return
+
+    label = args[0].strip()
+    if label in contacts:
+        del contacts[label]
+        await update.message.reply_text(f"🗑️ Beneficiary `{label}` removed from autonomous monitoring.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ Beneficiary `{label}` not found. Check `/list`.", parse_mode="Markdown")
+
+
 async def simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Instantly triggers the autonomous purchase loop for the first registered phone."""
+    """Instantly triggers the autonomous purchase loop for a specific or first registered contact."""
     global TOTAL_SPENT_USD
     chat_id = update.effective_chat.id
-    phones = USER_MANDATES.get(chat_id, {}).get("phones", {})
+    session = get_user_session(chat_id)
+    contacts = session.get("contacts", {})
+    args = context.args
 
-    if not phones:
+    if not contacts:
         await update.message.reply_text(
-            "⚠️ *No numbers registered yet.*\n"
-            "Run `/add 9876543210 500` first, then run `/simulate`.",
+            "⚠️ *No beneficiaries registered yet.*\n"
+            "Run `/add Dad 9876543210 350` first, then run `/simulate`.",
             parse_mode="Markdown"
         )
         return
 
-    phone, record = next(iter(phones.items()))
+    # Select contact
+    if args and args[0].strip() in contacts:
+        label = args[0].strip()
+        record = contacts[label]
+    else:
+        label, record = next(iter(contacts.items()))
+
+    phone = record["phone"]
     operator = record["operator"]
-    amount = record["amount"]
-    max_budget = record["max_budget"]
+    amount = record["active_pack"]
+    guardrail_cap = record["guardrail_cap"]
     is_adjusted = record.get("is_tariff_adjusted", False)
     last_amount = record.get("last_amount", amount)
     plan_desc = record.get("target_desc", "Truly Unlimited")
 
+    # Vault Balance Verification
+    zec_cost = inr_to_zec(amount)
+    if session["vault_zec"] < zec_cost:
+        await update.message.reply_text(
+            f"🛑 *Insufficient Zcash Allowance Vault Balance:*\n"
+            f"• Required for {label}: `{zec_cost:.4f} ZEC` (₹{amount:.2f})\n"
+            f"• Available in Vault: `{session['vault_zec']:.4f} ZEC`\n"
+            "Use `/deposit 0.5` to fund your shielded vault.",
+            parse_mode="Markdown"
+        )
+        return
+
     # $5.00 Hard Testing Cap Verification
     order_cost_usd = amount / USD_TO_INR_RATE
     remaining_credit_usd = max(0.0, MAX_TEST_CREDIT_USD - TOTAL_SPENT_USD)
-
     if TOTAL_SPENT_USD + order_cost_usd > MAX_TEST_CREDIT_USD:
         await update.message.reply_text(
             f"🛑 *Hard Testing Limit Blocked ($5.00 Cap reached):*\n"
@@ -580,24 +702,27 @@ async def simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Autonomous Guardrail Check
-    if amount > max_budget:
+    if amount > guardrail_cap:
         await update.message.reply_text(
-            f"🛑 *Guardrail Alert:* Plan amount (₹{amount:.2f}) exceeds user cap (₹{max_budget:.2f}). Aborting recharge.",
+            f"🛑 *Guardrail Alert:* Plan amount (₹{amount:.2f}) exceeds user cap (₹{guardrail_cap:.2f}). Aborting recharge.",
             parse_mode="Markdown"
         )
         return
 
     running_msg = await update.message.reply_text(
-        "⚡ *Executing Autonomous Loop...*\n"
+        f"⚡ *Executing Autonomous Loop for {label}...*\n"
         "• Event: Expiry < 24h detected\n"
         "• Tariff reconciliation verified\n"
-        "• Guardrail verified\n"
-        f"• $5.00 Credit Guardrail verified (${order_cost_usd:.2f} allocated)\n"
+        f"• Vault allowance verified (`{zec_cost:.4f} ZEC` debit pending)\n"
         "• Calling Bitrefill Commerce Engine...",
         parse_mode="Markdown"
     )
 
-    order_result = await execute_bitrefill_order(operator, phone, amount)
+    # Execute Bitrefill purchase
+    order_result = await execute_bitrefill_order(operator, phone, amount, session["vault_zaddr"])
+    
+    # Deduct from user vault
+    session["vault_zec"] -= zec_cost
     TOTAL_SPENT_USD += order_cost_usd
     record["recharged"] = True
     record["last_order"] = order_result
@@ -610,15 +735,16 @@ async def simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reconcile_tag = f"Outdated Tariff Reconciled (₹{last_amount:.0f} ➔ ₹{amount:.0f}) -> " if is_adjusted else ""
 
     sim_text = (
-        f"⚡ *Expiry event triggered (< 24h) -> {reconcile_tag}Guardrail verified -> Bitrefill Order created -> Paid via Zcash Shielded Memo*\n\n"
-        "🌙 *AUTONOMOUS EXECUTION RECEIPT*\n"
+        f"⚡ *Expiry event triggered (< 24h) -> {reconcile_tag}Guardrail verified -> Vault debited -> Bitrefill Order created -> Paid via Zcash Shielded Memo*\n\n"
+        f"🌙 *AUTONOMOUS EXECUTION RECEIPT // {label.upper()}*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 *Order ID:* `{order_id}`\n"
-        f"📱 *Recipient:* `{masked_phone}`\n"
+        f"👤 *Beneficiary:* {label} (`{masked_phone}`)\n"
         f"📡 *Carrier:* {operator} ({record.get('circle', 'Mumbai')})\n"
         f"🔄 *Reconciled Plan:* ₹{amount:.2f} ({plan_desc})\n"
-        f"💰 *Amount Settled:* ₹{amount:.2f} (~${order_cost_usd:.2f} USD)\n"
-        f"💵 *Test Credit Remaining:* `${new_remaining:.2f} USD` (of $5.00 cap)\n"
+        f"💸 *Vault Debit:* `-{zec_cost:.4f} ZEC` (Remaining: `{session['vault_zec']:.4f} ZEC`)\n"
+        f"💰 *Fiat Equivalent:* ₹{amount:.2f} (~${order_cost_usd:.2f} USD)\n"
+        f"💵 *Test Credit Remaining:* `${new_remaining:.2f} USD`\n"
         f"🏷️ *Product SKU:* `{order_result['product_slug']}`\n"
         f"🛡️ *Settlement Engine:* Zcash Orchard Pool\n"
         f"🔐 *Shielded TXID:* `{txid}`\n"
@@ -632,38 +758,41 @@ async def simulate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the Zcash Incoming Viewing Key (IVK) receipt proving private settlement on Orchard pool."""
     chat_id = update.effective_chat.id
-    phones = USER_MANDATES.get(chat_id, {}).get("phones", {})
+    session = get_user_session(chat_id)
+    contacts = session.get("contacts", {})
 
     last_order = None
-    for p in phones.values():
+    target_beneficiary = "Primary"
+    for label, p in contacts.items():
         if p.get("last_order"):
             last_order = p["last_order"]
+            target_beneficiary = label
             break
 
     if not last_order:
-        # Generate standalone demonstrative receipt if no order has been simulated yet
-        zcash_info = generate_zcash_settlement("ord_bitrefill_inr_9821", "+919876543210", 299.0)
+        zcash_info = generate_zcash_settlement("ord_bitrefill_inr_9821", "+919876543210", 299.0, session["vault_zaddr"], 0.0994)
         order_ref = "ord_bitrefill_inr_9821"
-        amount_ref = "₹299.00"
+        amount_ref = "₹299.00 (0.0994 ZEC)"
     else:
         zcash_info = last_order["zcash"]
         order_ref = last_order["order_id"]
-        amount_ref = f"₹{last_order['amount']:.2f}"
+        amount_ref = f"₹{last_order['amount']:.2f} ({last_order.get('zec_cost', 0):.4f} ZEC)"
 
     memo_hex_preview = zcash_info["memo_hex"][:64] + "..." + zcash_info["memo_hex"][-32:]
 
     audit_text = (
-        "🛡️ *ZCASH ORCHARD POOL // IVK AUDIT RECEIPT*\n"
+        f"🛡️ *ZCASH ORCHARD POOL // IVK AUDIT RECEIPT*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔍 *Privacy Architecture:* Zero-Knowledge SNARKs\n"
+        f"👤 *Beneficiary Mandate:* {target_beneficiary}\n"
         f"📦 *Order Reference:* `{order_ref}`\n"
         f"💰 *Settlement Amount:* {amount_ref}\n"
+        f"📫 *Shielded Vault Source:*\n`{session['vault_zaddr']}`\n\n"
         f"🔐 *Incoming Viewing Key (IVK):*\n`{zcash_info['ivk']}`\n\n"
         f"🛡️ *Shielded TX Hash (txid):*\n`{zcash_info['txid']}`\n\n"
         f"📜 *512-Byte Shielded Memo Hex (Truncated):*\n`{memo_hex_preview}`\n\n"
         f"🔓 *Decrypted Memo Payload:*\n`{zcash_info['memo_preview']}`\n\n"
         "✅ *Verification Proof:*\n"
-        "Autonomous payment settled on-chain without disclosing sender wallet address, balances, or transaction graph."
+        "Allowance debited and settled on-chain without disclosing sender wallet address, balances, or transaction graph."
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(audit_text, parse_mode="Markdown")
@@ -674,45 +803,51 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------
 async def autonomous_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Checks all enrolled user mandates every 60 seconds.
-    If expiry <= 24 hours and not yet recharged, triggers Bitrefill order
-    and sends asynchronous notification: 'While you were asleep...'
+    Checks all enrolled user mandates across all beneficiaries every 60 seconds.
+    If expiry <= 24 hours and not yet recharged, debits the Zcash vault,
+    triggers Bitrefill order, and sends asynchronous notification: 'While you were asleep...'
     """
     global TOTAL_SPENT_USD
     now = datetime.now(timezone.utc)
-    logger.info("Autonomous scheduler scan running across active mandates...")
+    logger.info("Autonomous scheduler scan running across multi-beneficiary mandates...")
 
-    for chat_id, data in list(USER_MANDATES.items()):
-        phones = data.get("phones", {})
-        for phone, record in phones.items():
+    for chat_id, session in list(USER_DATA.items()):
+        contacts = session.get("contacts", {})
+        for label, record in contacts.items():
             if record.get("recharged"):
                 continue
 
             expiry_dt = parse_expiry(record.get("expiry"))
             time_remaining = (expiry_dt - now).total_seconds()
 
-            # Trigger condition: Expiry is within 24 hours (86400 seconds)
+            # Trigger condition: Expiry within 24 hours
             if time_remaining <= 86400:
-                amount = record["amount"]
-                max_budget = record["max_budget"]
+                amount = record["active_pack"]
+                guardrail_cap = record["guardrail_cap"]
+                zec_cost = inr_to_zec(amount)
 
-                # Enforce Hard $5.00 Credit Limit
-                order_cost_usd = amount / USD_TO_INR_RATE
-                if TOTAL_SPENT_USD + order_cost_usd > MAX_TEST_CREDIT_USD:
-                    logger.warning(
-                        f"Hard testing cap ($5.00) reached. Cannot recharge {phone} "
-                        f"(Cost: ${order_cost_usd:.2f}, Spent: ${TOTAL_SPENT_USD:.2f})."
-                    )
+                # Check Vault Balance
+                if session["vault_zec"] < zec_cost:
+                    logger.warning(f"Vault balance ({session['vault_zec']} ZEC) insufficient for {label} ({zec_cost} ZEC).")
                     continue
 
-                if amount > max_budget:
-                    logger.warning(f"Guardrail triggered for {phone}: amount ₹{amount} > cap ₹{max_budget}")
+                # Check $5 Testing Limit
+                order_cost_usd = amount / USD_TO_INR_RATE
+                if TOTAL_SPENT_USD + order_cost_usd > MAX_TEST_CREDIT_USD:
+                    logger.warning(f"Hard testing cap ($5.00) reached. Cannot recharge {label}.")
+                    continue
+
+                # Guardrail check
+                if amount > guardrail_cap:
+                    logger.warning(f"Guardrail triggered for {label}: amount ₹{amount} > cap ₹{guardrail_cap}")
                     continue
 
                 operator = record["operator"]
-                logger.info(f"Triggering autonomous recharge for {phone} ({operator})")
+                phone = record["phone"]
+                logger.info(f"Triggering autonomous recharge for {label} ({phone}, {operator})")
 
-                order_result = await execute_bitrefill_order(operator, phone, amount)
+                order_result = await execute_bitrefill_order(operator, phone, amount, session["vault_zaddr"])
+                session["vault_zec"] -= zec_cost
                 TOTAL_SPENT_USD += order_cost_usd
                 record["recharged"] = True
                 record["last_order"] = order_result
@@ -720,20 +855,19 @@ async def autonomous_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
                 masked_phone = phone[:3] + "•••" + phone[-4:] if len(phone) >= 7 else phone
                 order_id = order_result["order_id"]
                 txid = order_result["zcash"]["txid"]
-                remaining_usd = max(0.0, MAX_TEST_CREDIT_USD - TOTAL_SPENT_USD)
 
                 notification = (
                     "🌙 *While you were asleep...*\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "⚡ *NightShift Autonomous Protocol* detected plan expiry (< 24h) and recharged your number.\n\n"
-                    f"📱 *Recipient:* `{masked_phone}`\n"
-                    f"📡 *Carrier:* {operator}\n"
-                    f"💰 *Settled:* ₹{amount:.2f} (~${order_cost_usd:.2f} USD)\n"
-                    f"💵 *Test Credit Remaining:* `${remaining_usd:.2f} USD` (of $5.00 cap)\n"
+                    f"⚡ *NightShift Autonomous Agent* detected plan expiry (< 24h) and recharged `{label}`.\n\n"
+                    f"👤 *Beneficiary:* {label} (`{masked_phone}`)\n"
+                    f"📡 *Carrier:* {operator} ({record.get('circle', 'Mumbai')})\n"
+                    f"💰 *Settled:* ₹{amount:.2f} (`-{zec_cost:.4f} ZEC`)\n"
+                    f"📫 *Remaining Vault:* `{session['vault_zec']:.4f} ZEC`\n"
                     f"📦 *Bitrefill Order:* `{order_id}`\n"
                     f"🔐 *Zcash Shielded Tx:* `{txid}`\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "Your connectivity was protected without manual intervention."
+                    "Your family's connectivity was protected without manual intervention."
                 )
 
                 try:
@@ -747,7 +881,6 @@ async def autonomous_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors caused by Updates or transient network drops cleanly."""
-    # Filter out common transient long-polling network errors
     if isinstance(context.error, (httpx.ReadError, httpx.ConnectError)):
         logger.warning(f"Transient Telegram network drop encountered: {context.error}. Reconnecting...")
         return
@@ -755,7 +888,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main():
-    print("🌙 Initializing NightShift Bot...")
+    print("🌙 Initializing NightShift Multi-Beneficiary Agent...")
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Register Global Error Handler
@@ -763,9 +896,12 @@ def main():
 
     # Command Handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("vault", vault_command))
+    application.add_handler(CommandHandler("deposit", deposit_command))
     application.add_handler(CommandHandler("credits", credits_command))
     application.add_handler(CommandHandler("add", add_command))
     application.add_handler(CommandHandler("list", list_command))
+    application.add_handler(CommandHandler("remove", remove_command))
     application.add_handler(CommandHandler("simulate", simulate_command))
     application.add_handler(CommandHandler("audit", audit_command))
 
@@ -777,7 +913,7 @@ def main():
     else:
         logger.warning("JobQueue not initialized. Ensure python-telegram-bot[job-queue] is installed.")
 
-    print("🚀 NightShift Bot is running and listening for Telegram updates!")
+    print("🚀 NightShift Agent is running and listening for Telegram updates!")
     application.run_polling()
 
 
