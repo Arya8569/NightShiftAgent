@@ -89,7 +89,22 @@
 
 ---
 
-## 🛠️ Quickstart
+## 🚀 1-Click Deployment on Render
+
+This project is pre-configured with a [`render.yaml`](render.yaml) blueprint and an automated HTTP health-check server for **Render Free Tier**:
+
+1. Fork or push this repo to your GitHub account (`Arya8569/NightShiftAgent`).
+2. Go to **[Render Dashboard](https://dashboard.render.com/)** $\rightarrow$ Click **New +** $\rightarrow$ **Web Service** (or **Blueprint**).
+3. Connect your repository.
+4. Add the 3 Environment Variables under settings:
+   - `TELEGRAM_BOT_TOKEN`: Your token from @BotFather
+   - `BITREFILL_API_KEY`: Your Bitrefill API v2 key
+   - `WAY2API_KEY`: Your Way2API key
+5. Click **Deploy** — your bot will automatically run 24/7 in the cloud!
+
+---
+
+## 🛠️ Local Quickstart
 
 ```bash
 # 1. Clone & install

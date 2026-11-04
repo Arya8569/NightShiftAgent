@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: nightshift-bot
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: BITREFILL_API_KEY
+        sync: false
+      - key: WAY2API_KEY
+        sync: false

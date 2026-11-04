@@ -1,5 +1,6 @@
 import os
 import sys
+import asyncio
 import logging
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -922,9 +923,53 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
+async def post_init(application) -> None:
+    """
+    Binds a lightweight HTTP health check endpoint for Render Web Service (Free Tier).
+    Render sends periodic GET requests to $PORT to verify service health.
+    """
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        return
+
+    async def handle_health_check(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read(1024)
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n\r\n"
+                '{"status":"healthy","service":"NightShift Autonomous Agent"}\r\n'
+            )
+            writer.write(response.encode("utf-8"))
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle_health_check, "0.0.0.0", port)
+    logger.info(f"Render health check server successfully bound to 0.0.0.0:{port}")
+    asyncio.create_task(server.serve_forever())
+
+
 def main():
     print("🌙 Initializing NightShift Multi-Beneficiary Agent...")
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     # Register Global Error Handler
     application.add_error_handler(error_handler)
